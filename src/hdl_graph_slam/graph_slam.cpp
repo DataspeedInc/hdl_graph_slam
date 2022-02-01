@@ -308,14 +308,11 @@ int GraphSLAM::optimize(int num_iterations) {
   double chi2 = graph->chi2();
 
   std::cout << "optimize!!" << std::endl;
-  auto t1 = ros::WallTime::now();
   int iterations = graph->optimize(num_iterations);
 
-  auto t2 = ros::WallTime::now();
   std::cout << "done" << std::endl;
   std::cout << "iterations: " << iterations << " / " << num_iterations << std::endl;
   std::cout << "chi2: (before)" << chi2 << " -> (after)" << graph->chi2() << std::endl;
-  std::cout << "time: " << boost::format("%.3f") % (t2 - t1).toSec() << "[sec]" << std::endl;
 
   return iterations;
 }

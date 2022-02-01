@@ -14,31 +14,30 @@
 #include <Eigen/Dense>
 #include <pcl/io/pcd_io.h>
 
-#include <ros/ros.h>
+#include <rclcpp/rclcpp.hpp>
 #include <geodesy/utm.h>
 #include <geodesy/wgs84.h>
-#include <pcl_ros/point_cloud.h>
+#include <pcl_conversions/pcl_conversions.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
-#include <tf_conversions/tf_eigen.h>
-#include <tf/transform_listener.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
 
-#include <std_msgs/Time.h>
-#include <nav_msgs/Odometry.h>
-#include <nmea_msgs/Sentence.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/NavSatFix.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <geographic_msgs/GeoPointStamped.h>
-#include <visualization_msgs/MarkerArray.h>
-#include <hdl_graph_slam/FloorCoeffs.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nmea_msgs/msg/sentence.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geographic_msgs/msg/geo_point_stamped.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <hdl_graph_slam/msg/floor_coeffs.hpp>
+#include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <geometry_msgs/msg/quaternion_stamped.hpp>
 
-#include <hdl_graph_slam/SaveMap.h>
-#include <hdl_graph_slam/DumpGraph.h>
-
-#include <nodelet/nodelet.h>
-#include <pluginlib/class_list_macros.h>
+#include <hdl_graph_slam/srv/save_map.hpp>
+#include <hdl_graph_slam/srv/dump_graph.hpp>
 
 #include <hdl_graph_slam/ros_utils.hpp>
 #include <hdl_graph_slam/ros_time_hash.hpp>
@@ -61,89 +60,192 @@
 
 namespace hdl_graph_slam {
 
-class HdlGraphSlamNodelet : public nodelet::Nodelet {
+typedef struct {
+  std::string map_frame_id;
+  std::string odom_frame_id;
+  std::string points_topic;
+  std::string g2o_solver_type;
+  std::string odometry_edge_robust_kernel;
+  std::string gps_edge_robust_kernel;
+  std::string imu_orientation_edge_robust_kernel;
+  std::string imu_acceleration_edge_robust_kernel;
+  std::string loop_closure_edge_robust_kernel;
+  std::string floor_edge_robust_kernel;
+  std::string fix_first_node_stddev;
+  double map_cloud_resolution;
+  double gps_time_offset;
+  double gps_edge_stddev_xy;
+  double gps_edge_stddev_z;
+  double floor_edge_stddev;
+  double imu_time_offset;
+  double imu_orientation_edge_stddev;
+  double imu_acceleration_edge_stddev;
+  double graph_update_interval;
+  double map_cloud_update_interval;
+  double odometry_edge_robust_kernel_size;
+  double gps_edge_robust_kernel_size;
+  double imu_orientation_edge_robust_kernel_size;
+  double imu_acceleration_edge_robust_kernel_size;
+  double loop_closure_edge_robust_kernel_size;
+  double floor_edge_robust_kernel_size;
+  int max_keyframes_per_update;
+  int g2o_solver_num_iterations;
+  bool enable_imu_orientation;
+  bool enable_imu_acceleration;
+  bool enable_gps;
+  bool fix_first_node;
+  bool fix_first_node_adaptive;
+} HdlGraphSlamParams;
+
+class HdlGraphSlamNode : public rclcpp::Node {
 public:
   typedef pcl::PointXYZI PointT;
-  typedef message_filters::sync_policies::ApproximateTime<nav_msgs::Odometry, sensor_msgs::PointCloud2> ApproxSyncPolicy;
+  typedef message_filters::sync_policies::ApproximateTime<nav_msgs::msg::Odometry, sensor_msgs::msg::PointCloud2> ApproxSyncPolicy;
 
-  HdlGraphSlamNodelet() {}
-  virtual ~HdlGraphSlamNodelet() {}
-
-  virtual void onInit() {
-    nh = getNodeHandle();
-    mt_nh = getMTNodeHandle();
-    private_nh = getPrivateNodeHandle();
-
-    // init parameters
-    map_frame_id = private_nh.param<std::string>("map_frame_id", "map");
-    odom_frame_id = private_nh.param<std::string>("odom_frame_id", "odom");
-    map_cloud_resolution = private_nh.param<double>("map_cloud_resolution", 0.05);
+  HdlGraphSlamNode(const rclcpp::NodeOptions& options)
+  : rclcpp::Node("hdl_graph_slam_node", options)
+  {
     trans_odom2map.setIdentity();
 
-    max_keyframes_per_update = private_nh.param<int>("max_keyframes_per_update", 10);
+    // Main parameters
+    params.map_frame_id                             = declare_parameter<std::string>("map_frame_id", std::string("map"));
+    params.odom_frame_id                            = declare_parameter<std::string>("odom_frame_id", std::string("odom"));
+    params.g2o_solver_type                          = declare_parameter<std::string>("g2o_solver_type", std::string("lm_var"));
+    params.odometry_edge_robust_kernel              = declare_parameter<std::string>("odometry_edge_robust_kernel", std::string("NONE"));
+    params.gps_edge_robust_kernel                   = declare_parameter<std::string>("gps_edge_robust_kernel", std::string("NONE"));
+    params.imu_orientation_edge_robust_kernel       = declare_parameter<std::string>("imu_orientation_edge_robust_kernel", std::string("NONE"));
+    params.imu_acceleration_edge_robust_kernel      = declare_parameter<std::string>("imu_acceleration_edge_robust_kernel", std::string("NONE"));
+    params.floor_edge_robust_kernel                 = declare_parameter<std::string>("floor_edge_robust_kernel", std::string("NONE"));
+    params.loop_closure_edge_robust_kernel          = declare_parameter<std::string>("loop_closure_edge_robust_kernel", std::string("NONE"));
+    params.fix_first_node_stddev                    = declare_parameter<std::string>("fix_first_node_stddev", std::string("1 1 1 1 1 1"));
+    params.points_topic                             = declare_parameter<std::string>("points_topic", std::string("/velodyne_points"));
+    params.map_cloud_resolution                     = declare_parameter<double>("map_cloud_resolution", 0.05);
+    params.graph_update_interval                    = declare_parameter<double>("graph_update_interval", 3.0);
+    params.map_cloud_update_interval                = declare_parameter<double>("map_cloud_update_interval", 10.0);
+    params.odometry_edge_robust_kernel_size         = declare_parameter<double>("odometry_edge_robust_kernel_size", 1.0);
+    params.gps_edge_robust_kernel_size              = declare_parameter<double>("gps_edge_robust_kernel_size", 1.0);
+    params.imu_orientation_edge_robust_kernel_size  = declare_parameter<double>("imu_orientation_edge_robust_kernel_size", 1.0);
+    params.imu_acceleration_edge_robust_kernel_size = declare_parameter<double>("imu_acceleration_edge_robust_kernel_size", 1.0);
+    params.loop_closure_edge_robust_kernel_size     = declare_parameter<double>("loop_closure_edge_robust_kernel_size", 1.0);
+    params.floor_edge_robust_kernel_size            = declare_parameter<double>("floor_edge_robust_kernel_size", 1.0);
+    params.gps_time_offset                          = declare_parameter<double>("gps_time_offset", 0.0);
+    params.gps_edge_stddev_xy                       = declare_parameter<double>("gps_edge_stddev_xy", 10000.0);
+    params.gps_edge_stddev_z                        = declare_parameter<double>("gps_edge_stddev_z", 10.0);
+    params.floor_edge_stddev                        = declare_parameter<double>("floor_edge_stddev", 10.0);
+    params.imu_time_offset                          = declare_parameter<double>("imu_time_offset", 0.0);
+    params.imu_orientation_edge_stddev              = declare_parameter<double>("imu_orientation_edge_stddev", 0.1);
+    params.imu_acceleration_edge_stddev             = declare_parameter<double>("imu_acceleration_edge_stddev", 3.0);
+    params.max_keyframes_per_update                 = declare_parameter<int>("max_keyframes_per_update", 10);
+    params.g2o_solver_num_iterations                = declare_parameter<int>("g2o_solver_num_iterations", 1024);
+    params.enable_gps                               = declare_parameter<bool>("enable_gps", true);
+    params.fix_first_node                           = declare_parameter<bool>("fix_first_node", false);
+    params.fix_first_node_adaptive                  = declare_parameter<bool>("fix_first_node_adaptive", true);
+    params.enable_imu_orientation                   = declare_parameter<bool>("enable_imu_orientation", false);
+    params.enable_imu_acceleration                  = declare_parameter<bool>("enable_imu_acceleration", false);
 
-    //
+    map_publish_timer = rclcpp::create_timer(this, get_clock(), std::chrono::milliseconds((int)(params.map_cloud_update_interval * 1000)), std::bind(&HdlGraphSlamNode::map_points_publish_timer_callback, this));
+    optimization_timer = rclcpp::create_timer(this, get_clock(), std::chrono::milliseconds((int)(params.graph_update_interval * 1000)), std::bind(&HdlGraphSlamNode::optimization_timer_callback, this));
+    graph_slam.reset(new GraphSLAM(params.g2o_solver_type));
+    if(params.enable_gps) {
+      gps_sub = create_subscription<geographic_msgs::msg::GeoPointStamped>("/gps/geopoint", 1024, std::bind(&HdlGraphSlamNode::gps_callback, this, std::placeholders::_1));
+      nmea_sub = create_subscription<nmea_msgs::msg::Sentence>("/gpsimu_driver/nmea_sentence", 1024, std::bind(&HdlGraphSlamNode::nmea_callback, this, std::placeholders::_1));
+      navsat_sub = create_subscription<sensor_msgs::msg::NavSatFix>("/gps/navsat", 1024, std::bind(&HdlGraphSlamNode::navsat_callback, this, std::placeholders::_1));
+    }
+
+    // Keyframe updater params
+    KeyframeUpdaterParams keyframe_params;
+    keyframe_params.keyframe_delta_trans = declare_parameter<double>("keyframe_delta_trans", 2.0);
+    keyframe_params.keyframe_delta_angle = declare_parameter<double>("keyframe_delta_angle", 2.0);
+
+    // Loop detector params
+    LoopDetectorParams loop_params;
+    loop_params.distance_thresh = declare_parameter<double>("distance_thresh", 5.0);
+    loop_params.accum_distance_thresh = declare_parameter<double>("accum_distance_thresh", 8.0);
+    loop_params.min_edge_interval = declare_parameter<double>("min_edge_interval", 5.0);
+    loop_params.fitness_score_max_range = declare_parameter<double>("fitness_score_max_range", std::numeric_limits<double>::max());
+    loop_params.fitness_score_thresh = declare_parameter<double>("fitness_score_thresh", 0.5);
+
+    // Registration params
+    RegistrationParams reg_params;
+    reg_params.registration_method = declare_parameter<std::string>("registration_method", std::string("NDT_OMP"));
+    reg_params.reg_nn_search_method = declare_parameter<std::string>("reg_nn_search_method", std::string("DIRECT7"));
+    reg_params.reg_transformation_epsilon = declare_parameter<double>("reg_transformation_epsilon", 0.01);
+    reg_params.reg_max_correspondence_distance = declare_parameter<double>("reg_max_correspondence_distance", 2.5);
+    reg_params.reg_resolution = declare_parameter<double>("reg_resolution", 1.0);
+    reg_params.reg_num_threads = declare_parameter<int>("reg_num_threads", 0);
+    reg_params.reg_maximum_iterations = declare_parameter<int>("reg_maximum_iterations", 64);
+    reg_params.reg_correspondence_randomness = declare_parameter<int>("reg_correspondence_randomness", 20);
+    reg_params.reg_max_optimizer_iterations = declare_parameter<int>("reg_max_optimizer_iterations", 20);
+    reg_params.reg_use_reciprocal_correspondences = declare_parameter<bool>("reg_use_reciprocal_correspondences", false);
+
+    // Information matrix params
+    InformationMatrixParams inf_mat_params;
+    inf_mat_params.const_stddev_x = declare_parameter<double>("const_stddev_x", 0.5);
+    inf_mat_params.const_stddev_q = declare_parameter<double>("const_stddev_q", 0.1);
+    inf_mat_params.var_gain_a = declare_parameter<double>("var_gain_a", 20.0);
+    inf_mat_params.min_stddev_x = declare_parameter<double>("min_stddev_x", 0.1);
+    inf_mat_params.max_stddev_x = declare_parameter<double>("max_stddev_x", 5.0);
+    inf_mat_params.min_stddev_q = declare_parameter<double>("min_stddev_q", 0.05);
+    inf_mat_params.max_stddev_q = declare_parameter<double>("max_stddev_q", 0.2);
+    inf_mat_params.use_const_inf_matrix = declare_parameter<bool>("use_const_inf_matrix", false);
+
+    tf_buffer = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+
     anchor_node = nullptr;
     anchor_edge = nullptr;
     floor_plane_node = nullptr;
-    graph_slam.reset(new GraphSLAM(private_nh.param<std::string>("g2o_solver_type", "lm_var")));
-    keyframe_updater.reset(new KeyframeUpdater(private_nh));
-    loop_detector.reset(new LoopDetector(private_nh));
-    map_cloud_generator.reset(new MapCloudGenerator());
-    inf_calclator.reset(new InformationMatrixCalculator(private_nh));
-    nmea_parser.reset(new NmeaSentenceParser());
-
-    gps_time_offset = private_nh.param<double>("gps_time_offset", 0.0);
-    gps_edge_stddev_xy = private_nh.param<double>("gps_edge_stddev_xy", 10000.0);
-    gps_edge_stddev_z = private_nh.param<double>("gps_edge_stddev_z", 10.0);
-    floor_edge_stddev = private_nh.param<double>("floor_edge_stddev", 10.0);
-
-    imu_time_offset = private_nh.param<double>("imu_time_offset", 0.0);
-    enable_imu_orientation = private_nh.param<bool>("enable_imu_orientation", false);
-    enable_imu_acceleration = private_nh.param<bool>("enable_imu_acceleration", false);
-    imu_orientation_edge_stddev = private_nh.param<double>("imu_orientation_edge_stddev", 0.1);
-    imu_acceleration_edge_stddev = private_nh.param<double>("imu_acceleration_edge_stddev", 3.0);
-
-    points_topic = private_nh.param<std::string>("points_topic", "/velodyne_points");
 
     // subscribers
-    odom_sub.reset(new message_filters::Subscriber<nav_msgs::Odometry>(mt_nh, "/odom", 256));
-    cloud_sub.reset(new message_filters::Subscriber<sensor_msgs::PointCloud2>(mt_nh, "/filtered_points", 32));
+    rmw_qos_profile_t qos =
+    {
+      RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+      1000,
+      RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+      RMW_QOS_POLICY_DURABILITY_VOLATILE,
+      RMW_QOS_DEADLINE_DEFAULT,
+      RMW_QOS_LIFESPAN_DEFAULT,
+      RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
+      RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
+      false
+    };
+    odom_sub.reset(new message_filters::Subscriber<nav_msgs::msg::Odometry>(this, "/odom", qos));
+    cloud_sub.reset(new message_filters::Subscriber<sensor_msgs::msg::PointCloud2>(rclcpp::Node::SharedPtr(this), "/filtered_points", qos));
     sync.reset(new message_filters::Synchronizer<ApproxSyncPolicy>(ApproxSyncPolicy(32), *odom_sub, *cloud_sub));
-    sync->registerCallback(boost::bind(&HdlGraphSlamNodelet::cloud_callback, this, _1, _2));
-    imu_sub = nh.subscribe("/gpsimu_driver/imu_data", 1024, &HdlGraphSlamNodelet::imu_callback, this);
-    floor_sub = nh.subscribe("/floor_detection/floor_coeffs", 1024, &HdlGraphSlamNodelet::floor_coeffs_callback, this);
-
-    if(private_nh.param<bool>("enable_gps", true)) {
-      gps_sub = mt_nh.subscribe("/gps/geopoint", 1024, &HdlGraphSlamNodelet::gps_callback, this);
-      nmea_sub = mt_nh.subscribe("/gpsimu_driver/nmea_sentence", 1024, &HdlGraphSlamNodelet::nmea_callback, this);
-      navsat_sub = mt_nh.subscribe("/gps/navsat", 1024, &HdlGraphSlamNodelet::navsat_callback, this);
-    }
+    sync->registerCallback(std::bind(&HdlGraphSlamNode::cloud_callback, this, std::placeholders::_1, std::placeholders::_2));
+    imu_sub = create_subscription<sensor_msgs::msg::Imu>("/gpsimu_driver/imu_data", 1024, std::bind(&HdlGraphSlamNode::imu_callback, this, std::placeholders::_1));
+    floor_sub = create_subscription<msg::FloorCoeffs>("/floor_detection/floor_coeffs", 1024, std::bind(&HdlGraphSlamNode::floor_coeffs_callback, this, std::placeholders::_1));
 
     // publishers
-    markers_pub = mt_nh.advertise<visualization_msgs::MarkerArray>("/hdl_graph_slam/markers", 16);
-    odom2map_pub = mt_nh.advertise<geometry_msgs::TransformStamped>("/hdl_graph_slam/odom2pub", 16);
-    map_points_pub = mt_nh.advertise<sensor_msgs::PointCloud2>("/hdl_graph_slam/map_points", 1, true);
-    read_until_pub = mt_nh.advertise<std_msgs::Header>("/hdl_graph_slam/read_until", 32);
+    markers_pub = create_publisher<visualization_msgs::msg::MarkerArray>("/hdl_graph_slam/markers", 16);
+    odom2map_pub = create_publisher<geometry_msgs::msg::TransformStamped>("/hdl_graph_slam/odom2pub", 16);
+    map_points_pub = create_publisher<sensor_msgs::msg::PointCloud2>("/hdl_graph_slam/map_points", 1);
+    read_until_pub = create_publisher<std_msgs::msg::Header>("/hdl_graph_slam/read_until", 32);
 
-    dump_service_server = mt_nh.advertiseService("/hdl_graph_slam/dump", &HdlGraphSlamNodelet::dump_service, this);
-    save_map_service_server = mt_nh.advertiseService("/hdl_graph_slam/save_map", &HdlGraphSlamNodelet::save_map_service, this);
+    // service servers
+    dump_service_server = create_service<srv::DumpGraph>("/hdl_graph_slam/dump", std::bind(&HdlGraphSlamNode::dump_service, this, std::placeholders::_1, std::placeholders::_2));
+    save_map_service_server = create_service<srv::SaveMap>("/hdl_graph_slam/save_map", std::bind(&HdlGraphSlamNode::save_map_service, this, std::placeholders::_1, std::placeholders::_2));
 
     graph_updated = false;
-    double graph_update_interval = private_nh.param<double>("graph_update_interval", 3.0);
-    double map_cloud_update_interval = private_nh.param<double>("map_cloud_update_interval", 10.0);
-    optimization_timer = mt_nh.createWallTimer(ros::WallDuration(graph_update_interval), &HdlGraphSlamNodelet::optimization_timer_callback, this);
-    map_publish_timer = mt_nh.createWallTimer(ros::WallDuration(map_cloud_update_interval), &HdlGraphSlamNodelet::map_points_publish_timer_callback, this);
+    nmea_parser.reset(new NmeaSentenceParser());
+    map_cloud_generator.reset(new MapCloudGenerator());
+    keyframe_updater.reset(new KeyframeUpdater(keyframe_params));
+    loop_detector.reset(new LoopDetector(loop_params, reg_params));
+    inf_calclator.reset(new InformationMatrixCalculator(inf_mat_params));
   }
 
 private:
+
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb;
+  HdlGraphSlamParams params;
+
   /**
    * @brief received point clouds are pushed to #keyframe_queue
    * @param odom_msg
    * @param cloud_msg
    */
-  void cloud_callback(const nav_msgs::OdometryConstPtr& odom_msg, const sensor_msgs::PointCloud2::ConstPtr& cloud_msg) {
-    const ros::Time& stamp = cloud_msg->header.stamp;
+  void cloud_callback(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg, const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg) {
+    const rclcpp::Time& stamp = cloud_msg->header.stamp;
     Eigen::Isometry3d odom = odom2isometry(odom_msg);
 
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
@@ -155,12 +257,12 @@ private:
     if(!keyframe_updater->update(odom)) {
       std::lock_guard<std::mutex> lock(keyframe_queue_mutex);
       if(keyframe_queue.empty()) {
-        std_msgs::Header read_until;
-        read_until.stamp = stamp + ros::Duration(10, 0);
+        std_msgs::msg::Header read_until;
+        read_until.stamp = stamp + rclcpp::Duration(10, 0);
         read_until.frame_id = points_topic;
-        read_until_pub.publish(read_until);
+        read_until_pub->publish(read_until);
         read_until.frame_id = "/filtered_points";
-        read_until_pub.publish(read_until);
+        read_until_pub->publish(read_until);
       }
 
       return;
@@ -179,7 +281,6 @@ private:
    */
   bool flush_keyframe_queue() {
     std::lock_guard<std::mutex> lock(keyframe_queue_mutex);
-
     if(keyframe_queue.empty()) {
       return false;
     }
@@ -189,7 +290,7 @@ private:
     trans_odom2map_mutex.unlock();
 
     int num_processed = 0;
-    for(int i = 0; i < std::min<int>(keyframe_queue.size(), max_keyframes_per_update); i++) {
+    for(int i = 0; i < std::min<int>(keyframe_queue.size(), params.max_keyframes_per_update); i++) {
       num_processed = i;
 
       const auto& keyframe = keyframe_queue[i];
@@ -203,9 +304,9 @@ private:
 
       // fix the first node
       if(keyframes.empty() && new_keyframes.size() == 1) {
-        if(private_nh.param<bool>("fix_first_node", false)) {
+        if(params.fix_first_node) {
           Eigen::MatrixXd inf = Eigen::MatrixXd::Identity(6, 6);
-          std::stringstream sst(private_nh.param<std::string>("fix_first_node_stddev", "1 1 1 1 1 1"));
+          std::stringstream sst(params.fix_first_node_stddev);
           for(int i = 0; i < 6; i++) {
             double stddev = 1.0;
             sst >> stddev;
@@ -228,28 +329,28 @@ private:
       Eigen::Isometry3d relative_pose = keyframe->odom.inverse() * prev_keyframe->odom;
       Eigen::MatrixXd information = inf_calclator->calc_information_matrix(keyframe->cloud, prev_keyframe->cloud, relative_pose);
       auto edge = graph_slam->add_se3_edge(keyframe->node, prev_keyframe->node, relative_pose, information);
-      graph_slam->add_robust_kernel(edge, private_nh.param<std::string>("odometry_edge_robust_kernel", "NONE"), private_nh.param<double>("odometry_edge_robust_kernel_size", 1.0));
+      graph_slam->add_robust_kernel(edge, params.odometry_edge_robust_kernel, params.odometry_edge_robust_kernel_size);
     }
 
-    std_msgs::Header read_until;
-    read_until.stamp = keyframe_queue[num_processed]->stamp + ros::Duration(10, 0);
+    std_msgs::msg::Header read_until;
+    read_until.stamp = keyframe_queue[num_processed]->stamp + rclcpp::Duration(10, 0);
     read_until.frame_id = points_topic;
-    read_until_pub.publish(read_until);
+    read_until_pub->publish(read_until);
     read_until.frame_id = "/filtered_points";
-    read_until_pub.publish(read_until);
+    read_until_pub->publish(read_until);
 
     keyframe_queue.erase(keyframe_queue.begin(), keyframe_queue.begin() + num_processed + 1);
     return true;
   }
 
-  void nmea_callback(const nmea_msgs::SentenceConstPtr& nmea_msg) {
+  void nmea_callback(const nmea_msgs::msg::Sentence::ConstSharedPtr nmea_msg) {
     GPRMC grmc = nmea_parser->parse(nmea_msg->sentence);
 
     if(grmc.status != 'A') {
       return;
     }
 
-    geographic_msgs::GeoPointStampedPtr gps_msg(new geographic_msgs::GeoPointStamped());
+    geographic_msgs::msg::GeoPointStamped::SharedPtr gps_msg(new geographic_msgs::msg::GeoPointStamped());
     gps_msg->header = nmea_msg->header;
     gps_msg->position.latitude = grmc.latitude;
     gps_msg->position.longitude = grmc.longitude;
@@ -258,8 +359,8 @@ private:
     gps_callback(gps_msg);
   }
 
-  void navsat_callback(const sensor_msgs::NavSatFixConstPtr& navsat_msg) {
-    geographic_msgs::GeoPointStampedPtr gps_msg(new geographic_msgs::GeoPointStamped());
+  void navsat_callback(const sensor_msgs::msg::NavSatFix::ConstSharedPtr navsat_msg) {
+    geographic_msgs::msg::GeoPointStamped::SharedPtr gps_msg(new geographic_msgs::msg::GeoPointStamped());
     gps_msg->header = navsat_msg->header;
     gps_msg->position.latitude = navsat_msg->latitude;
     gps_msg->position.longitude = navsat_msg->longitude;
@@ -271,9 +372,10 @@ private:
    * @brief received gps data is added to #gps_queue
    * @param gps_msg
    */
-  void gps_callback(const geographic_msgs::GeoPointStampedPtr& gps_msg) {
+  void gps_callback(const geographic_msgs::msg::GeoPointStamped::SharedPtr gps_msg) {
     std::lock_guard<std::mutex> lock(gps_queue_mutex);
-    gps_msg->header.stamp += ros::Duration(gps_time_offset);
+    rclcpp::Duration offset(std::chrono::milliseconds((int)(1000.0 * params.gps_time_offset)));
+    gps_msg->header.stamp = rclcpp::Time(gps_msg->header.stamp) + offset;
     gps_queue.push_back(gps_msg);
   }
 
@@ -303,8 +405,8 @@ private:
       // find the gps data which is closest to the keyframe
       auto closest_gps = gps_cursor;
       for(auto gps = gps_cursor; gps != gps_queue.end(); gps++) {
-        auto dt = ((*closest_gps)->header.stamp - keyframe->stamp).toSec();
-        auto dt2 = ((*gps)->header.stamp - keyframe->stamp).toSec();
+        auto dt = (rclcpp::Time((*closest_gps)->header.stamp) - keyframe->stamp).seconds();
+        auto dt2 = (rclcpp::Time((*gps)->header.stamp) - keyframe->stamp).seconds();
         if(std::abs(dt) < std::abs(dt2)) {
           break;
         }
@@ -314,7 +416,7 @@ private:
 
       // if the time residual between the gps and keyframe is too large, skip it
       gps_cursor = closest_gps;
-      if(0.2 < std::abs(((*closest_gps)->header.stamp - keyframe->stamp).toSec())) {
+      if(0.2 < std::abs((rclcpp::Time((*closest_gps)->header.stamp) - keyframe->stamp).seconds())) {
         continue;
       }
 
@@ -333,31 +435,32 @@ private:
 
       g2o::OptimizableGraph::Edge* edge;
       if(std::isnan(xyz.z())) {
-        Eigen::Matrix2d information_matrix = Eigen::Matrix2d::Identity() / gps_edge_stddev_xy;
+        Eigen::Matrix2d information_matrix = Eigen::Matrix2d::Identity() / params.gps_edge_stddev_xy;
         edge = graph_slam->add_se3_prior_xy_edge(keyframe->node, xyz.head<2>(), information_matrix);
       } else {
         Eigen::Matrix3d information_matrix = Eigen::Matrix3d::Identity();
-        information_matrix.block<2, 2>(0, 0) /= gps_edge_stddev_xy;
-        information_matrix(2, 2) /= gps_edge_stddev_z;
+        information_matrix.block<2, 2>(0, 0) /= params.gps_edge_stddev_xy;
+        information_matrix(2, 2) /= params.gps_edge_stddev_z;
         edge = graph_slam->add_se3_prior_xyz_edge(keyframe->node, xyz, information_matrix);
       }
-      graph_slam->add_robust_kernel(edge, private_nh.param<std::string>("gps_edge_robust_kernel", "NONE"), private_nh.param<double>("gps_edge_robust_kernel_size", 1.0));
+      graph_slam->add_robust_kernel(edge, params.gps_edge_robust_kernel, params.gps_edge_robust_kernel_size);
 
       updated = true;
     }
 
-    auto remove_loc = std::upper_bound(gps_queue.begin(), gps_queue.end(), keyframes.back()->stamp, [=](const ros::Time& stamp, const geographic_msgs::GeoPointStampedConstPtr& geopoint) { return stamp < geopoint->header.stamp; });
+    auto remove_loc = std::upper_bound(gps_queue.begin(), gps_queue.end(), keyframes.back()->stamp, [=](const rclcpp::Time& stamp, const geographic_msgs::msg::GeoPointStamped::ConstSharedPtr geopoint) { return stamp < rclcpp::Time(geopoint->header.stamp); });
     gps_queue.erase(gps_queue.begin(), remove_loc);
     return updated;
   }
 
-  void imu_callback(const sensor_msgs::ImuPtr& imu_msg) {
-    if(!enable_imu_orientation && !enable_imu_acceleration) {
+  void imu_callback(const sensor_msgs::msg::Imu::SharedPtr imu_msg) {
+    if(!params.enable_imu_orientation && !params.enable_imu_acceleration) {
       return;
     }
 
     std::lock_guard<std::mutex> lock(imu_queue_mutex);
-    imu_msg->header.stamp += ros::Duration(imu_time_offset);
+    rclcpp::Duration offset(std::chrono::milliseconds((int)(1000.0 * params.imu_time_offset)));
+    imu_msg->header.stamp = rclcpp::Time(imu_msg->header.stamp) + offset;
     imu_queue.push_back(imu_msg);
   }
 
@@ -382,8 +485,8 @@ private:
       // find imu data which is closest to the keyframe
       auto closest_imu = imu_cursor;
       for(auto imu = imu_cursor; imu != imu_queue.end(); imu++) {
-        auto dt = ((*closest_imu)->header.stamp - keyframe->stamp).toSec();
-        auto dt2 = ((*imu)->header.stamp - keyframe->stamp).toSec();
+        auto dt = (rclcpp::Time((*closest_imu)->header.stamp) - keyframe->stamp).seconds();
+        auto dt2 = (rclcpp::Time((*imu)->header.stamp) - keyframe->stamp).seconds();
         if(std::abs(dt) < std::abs(dt2)) {
           break;
         }
@@ -392,30 +495,51 @@ private:
       }
 
       imu_cursor = closest_imu;
-      if(0.2 < std::abs(((*closest_imu)->header.stamp - keyframe->stamp).toSec())) {
+      if(0.2 < std::abs((rclcpp::Time((*closest_imu)->header.stamp) - keyframe->stamp).seconds())) {
         continue;
       }
 
       const auto& imu_ori = (*closest_imu)->orientation;
       const auto& imu_acc = (*closest_imu)->linear_acceleration;
 
-      geometry_msgs::Vector3Stamped acc_imu;
-      geometry_msgs::Vector3Stamped acc_base;
-      geometry_msgs::QuaternionStamped quat_imu;
-      geometry_msgs::QuaternionStamped quat_base;
+      geometry_msgs::msg::Vector3Stamped acc_imu;
+      geometry_msgs::msg::Vector3Stamped acc_base;
+      geometry_msgs::msg::QuaternionStamped quat_imu;
+      geometry_msgs::msg::QuaternionStamped quat_base;
 
       quat_imu.header.frame_id = acc_imu.header.frame_id = (*closest_imu)->header.frame_id;
-      quat_imu.header.stamp = acc_imu.header.stamp = ros::Time(0);
+      quat_imu.header.stamp = acc_imu.header.stamp = rclcpp::Time(0);
       acc_imu.vector = (*closest_imu)->linear_acceleration;
       quat_imu.quaternion = (*closest_imu)->orientation;
 
+      geometry_msgs::msg::TransformStamped transform;
       try {
-        tf_listener.transformVector(base_frame_id, acc_imu, acc_base);
-        tf_listener.transformQuaternion(base_frame_id, quat_imu, quat_base);
+        transform = tf_buffer->lookupTransform(base_frame_id, (*closest_imu)->header.frame_id, rclcpp::Time(0));
       } catch(std::exception& e) {
         std::cerr << "failed to find transform!!" << std::endl;
         return false;
       }
+
+      tf2::Transform transform_tf;
+      transform_tf.setOrigin(tf2::Vector3(transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z));
+      transform_tf.setRotation(tf2::Quaternion(transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w));
+      tf2::Vector3 imu_frame_vect(acc_imu.vector.x, acc_imu.vector.y, acc_imu.vector.z);
+      tf2::Quaternion imu_frame_quat(quat_imu.quaternion.x, quat_imu.quaternion.y, quat_imu.quaternion.z, quat_imu.quaternion.w);
+
+      tf2::Vector3 base_frame_vect = transform_tf * imu_frame_vect;
+      acc_base.header.frame_id = base_frame_id;
+      acc_base.header.stamp = acc_imu.header.stamp;
+      acc_base.vector.x = base_frame_vect.x();
+      acc_base.vector.y = base_frame_vect.y();
+      acc_base.vector.z = base_frame_vect.z();
+
+      tf2::Quaternion base_frame_quat = transform_tf * imu_frame_quat;
+      quat_base.header.frame_id = base_frame_id;
+      quat_base.header.stamp = quat_imu.header.stamp;
+      quat_base.quaternion.x = base_frame_quat.x();
+      quat_base.quaternion.y = base_frame_quat.y();
+      quat_base.quaternion.z = base_frame_quat.z();
+      quat_base.quaternion.w = base_frame_quat.w();
 
       keyframe->acceleration = Eigen::Vector3d(acc_base.vector.x, acc_base.vector.y, acc_base.vector.z);
       keyframe->orientation = Eigen::Quaterniond(quat_base.quaternion.w, quat_base.quaternion.x, quat_base.quaternion.y, quat_base.quaternion.z);
@@ -424,21 +548,21 @@ private:
         keyframe->orientation->coeffs() = -keyframe->orientation->coeffs();
       }
 
-      if(enable_imu_orientation) {
-        Eigen::MatrixXd info = Eigen::MatrixXd::Identity(3, 3) / imu_orientation_edge_stddev;
+      if(params.enable_imu_orientation) {
+        Eigen::MatrixXd info = Eigen::MatrixXd::Identity(3, 3) / params.imu_orientation_edge_stddev;
         auto edge = graph_slam->add_se3_prior_quat_edge(keyframe->node, *keyframe->orientation, info);
-        graph_slam->add_robust_kernel(edge, private_nh.param<std::string>("imu_orientation_edge_robust_kernel", "NONE"), private_nh.param<double>("imu_orientation_edge_robust_kernel_size", 1.0));
+        graph_slam->add_robust_kernel(edge, params.imu_orientation_edge_robust_kernel, params.imu_orientation_edge_robust_kernel_size);
       }
 
-      if(enable_imu_acceleration) {
-        Eigen::MatrixXd info = Eigen::MatrixXd::Identity(3, 3) / imu_acceleration_edge_stddev;
+      if(params.enable_imu_acceleration) {
+        Eigen::MatrixXd info = Eigen::MatrixXd::Identity(3, 3) / params.imu_acceleration_edge_stddev;
         g2o::OptimizableGraph::Edge* edge = graph_slam->add_se3_prior_vec_edge(keyframe->node, -Eigen::Vector3d::UnitZ(), *keyframe->acceleration, info);
-        graph_slam->add_robust_kernel(edge, private_nh.param<std::string>("imu_acceleration_edge_robust_kernel", "NONE"), private_nh.param<double>("imu_acceleration_edge_robust_kernel_size", 1.0));
+        graph_slam->add_robust_kernel(edge, params.imu_acceleration_edge_robust_kernel, params.imu_acceleration_edge_robust_kernel_size);
       }
       updated = true;
     }
 
-    auto remove_loc = std::upper_bound(imu_queue.begin(), imu_queue.end(), keyframes.back()->stamp, [=](const ros::Time& stamp, const sensor_msgs::ImuConstPtr& imu) { return stamp < imu->header.stamp; });
+    auto remove_loc = std::upper_bound(imu_queue.begin(), imu_queue.end(), keyframes.back()->stamp, [=](const rclcpp::Time& stamp, const sensor_msgs::msg::Imu::ConstSharedPtr& imu) { return stamp < rclcpp::Time(imu->header.stamp); });
     imu_queue.erase(imu_queue.begin(), remove_loc);
 
     return updated;
@@ -448,7 +572,7 @@ private:
    * @brief received floor coefficients are added to #floor_coeffs_queue
    * @param floor_coeffs_msg
    */
-  void floor_coeffs_callback(const hdl_graph_slam::FloorCoeffsConstPtr& floor_coeffs_msg) {
+  void floor_coeffs_callback(const hdl_graph_slam::msg::FloorCoeffs::ConstSharedPtr floor_coeffs_msg) {
     if(floor_coeffs_msg->coeffs.empty()) {
       return;
     }
@@ -472,7 +596,7 @@ private:
 
     bool updated = false;
     for(const auto& floor_coeffs : floor_coeffs_queue) {
-      if(floor_coeffs->header.stamp > latest_keyframe_stamp) {
+      if(rclcpp::Time(floor_coeffs->header.stamp) > latest_keyframe_stamp) {
         break;
       }
 
@@ -489,16 +613,16 @@ private:
       const auto& keyframe = found->second;
 
       Eigen::Vector4d coeffs(floor_coeffs->coeffs[0], floor_coeffs->coeffs[1], floor_coeffs->coeffs[2], floor_coeffs->coeffs[3]);
-      Eigen::Matrix3d information = Eigen::Matrix3d::Identity() * (1.0 / floor_edge_stddev);
+      Eigen::Matrix3d information = Eigen::Matrix3d::Identity() * (1.0 / params.floor_edge_stddev);
       auto edge = graph_slam->add_se3_plane_edge(keyframe->node, floor_plane_node, coeffs, information);
-      graph_slam->add_robust_kernel(edge, private_nh.param<std::string>("floor_edge_robust_kernel", "NONE"), private_nh.param<double>("floor_edge_robust_kernel_size", 1.0));
+      graph_slam->add_robust_kernel(edge, params.floor_edge_robust_kernel, params.floor_edge_robust_kernel_size);
 
       keyframe->floor_coeffs = coeffs;
 
       updated = true;
     }
 
-    auto remove_loc = std::upper_bound(floor_coeffs_queue.begin(), floor_coeffs_queue.end(), latest_keyframe_stamp, [=](const ros::Time& stamp, const hdl_graph_slam::FloorCoeffsConstPtr& coeffs) { return stamp < coeffs->header.stamp; });
+    auto remove_loc = std::upper_bound(floor_coeffs_queue.begin(), floor_coeffs_queue.end(), latest_keyframe_stamp, [=](const rclcpp::Time& stamp, const hdl_graph_slam::msg::FloorCoeffs::ConstSharedPtr coeffs) { return stamp < rclcpp::Time(coeffs->header.stamp); });
     floor_coeffs_queue.erase(floor_coeffs_queue.begin(), remove_loc);
 
     return updated;
@@ -508,8 +632,8 @@ private:
    * @brief generate map point cloud and publish it
    * @param event
    */
-  void map_points_publish_timer_callback(const ros::WallTimerEvent& event) {
-    if(!map_points_pub.getNumSubscribers() || !graph_updated) {
+  void map_points_publish_timer_callback() {
+    if(!map_points_pub->get_subscription_count() || !graph_updated) {
       return;
     }
 
@@ -519,40 +643,39 @@ private:
     snapshot = keyframes_snapshot;
     keyframes_snapshot_mutex.unlock();
 
-    auto cloud = map_cloud_generator->generate(snapshot, map_cloud_resolution);
+    auto cloud = map_cloud_generator->generate(snapshot, params.map_cloud_resolution);
     if(!cloud) {
       return;
     }
 
-    cloud->header.frame_id = map_frame_id;
+    cloud->header.frame_id = params.map_frame_id;
     cloud->header.stamp = snapshot.back()->cloud->header.stamp;
 
-    sensor_msgs::PointCloud2Ptr cloud_msg(new sensor_msgs::PointCloud2());
-    pcl::toROSMsg(*cloud, *cloud_msg);
-
-    map_points_pub.publish(cloud_msg);
+    sensor_msgs::msg::PointCloud2 cloud_msg;
+    pcl::toROSMsg(*cloud, cloud_msg);
+    map_points_pub->publish(cloud_msg);
   }
 
   /**
    * @brief this methods adds all the data in the queues to the pose graph, and then optimizes the pose graph
    * @param event
    */
-  void optimization_timer_callback(const ros::WallTimerEvent& event) {
+  void optimization_timer_callback() {
     std::lock_guard<std::mutex> lock(main_thread_mutex);
 
     // add keyframes and floor coeffs in the queues to the pose graph
     bool keyframe_updated = flush_keyframe_queue();
 
     if(!keyframe_updated) {
-      std_msgs::Header read_until;
-      read_until.stamp = ros::Time::now() + ros::Duration(30, 0);
+      std_msgs::msg::Header read_until;
+      read_until.stamp = get_clock()->now() + rclcpp::Duration(30, 0);
       read_until.frame_id = points_topic;
-      read_until_pub.publish(read_until);
+      read_until_pub->publish(read_until);
       read_until.frame_id = "/filtered_points";
-      read_until_pub.publish(read_until);
+      read_until_pub->publish(read_until);
     }
 
-    if(!keyframe_updated & !flush_floor_queue() & !flush_gps_queue() & !flush_imu_queue()) {
+    if(!keyframe_updated && !flush_floor_queue() && !flush_gps_queue() && !flush_imu_queue()) {
       return;
     }
 
@@ -562,23 +685,22 @@ private:
       Eigen::Isometry3d relpose(loop->relative_pose.cast<double>());
       Eigen::MatrixXd information_matrix = inf_calclator->calc_information_matrix(loop->key1->cloud, loop->key2->cloud, relpose);
       auto edge = graph_slam->add_se3_edge(loop->key1->node, loop->key2->node, relpose, information_matrix);
-      graph_slam->add_robust_kernel(edge, private_nh.param<std::string>("loop_closure_edge_robust_kernel", "NONE"), private_nh.param<double>("loop_closure_edge_robust_kernel_size", 1.0));
+      graph_slam->add_robust_kernel(edge, params.loop_closure_edge_robust_kernel, params.loop_closure_edge_robust_kernel_size);
     }
-
     std::copy(new_keyframes.begin(), new_keyframes.end(), std::back_inserter(keyframes));
     new_keyframes.clear();
 
     // move the first node anchor position to the current estimate of the first node pose
     // so the first node moves freely while trying to stay around the origin
-    if(anchor_node && private_nh.param<bool>("fix_first_node_adaptive", true)) {
+    if(anchor_node && params.fix_first_node_adaptive){
       Eigen::Isometry3d anchor_target = static_cast<g2o::VertexSE3*>(anchor_edge->vertices()[1])->estimate();
       anchor_node->setEstimate(anchor_target);
     }
-
     // optimize the pose graph
-    int num_iterations = private_nh.param<int>("g2o_solver_num_iterations", 1024);
-    graph_slam->optimize(num_iterations);
-
+    graph_slam->optimize(params.g2o_solver_num_iterations);
+    if (keyframes.empty()) {
+      return;
+    }
     // publish tf
     const auto& keyframe = keyframes.back();
     Eigen::Isometry3d trans = keyframe->node->estimate() * keyframe->odom.inverse();
@@ -593,15 +715,14 @@ private:
     keyframes_snapshot.swap(snapshot);
     keyframes_snapshot_mutex.unlock();
     graph_updated = true;
-
-    if(odom2map_pub.getNumSubscribers()) {
-      geometry_msgs::TransformStamped ts = matrix2transform(keyframe->stamp, trans.matrix().cast<float>(), map_frame_id, odom_frame_id);
-      odom2map_pub.publish(ts);
+    if(odom2map_pub->get_subscription_count()) {
+      geometry_msgs::msg::TransformStamped ts = matrix2transform(keyframe->stamp, trans.matrix().cast<float>(), params.map_frame_id, params.odom_frame_id);
+      odom2map_pub->publish(ts);
     }
 
-    if(markers_pub.getNumSubscribers()) {
-      auto markers = create_marker_array(ros::Time::now());
-      markers_pub.publish(markers);
+    if(markers_pub->get_subscription_count()) {
+      auto markers = create_marker_array(get_clock()->now());
+      markers_pub->publish(markers);
     }
   }
 
@@ -610,26 +731,26 @@ private:
    * @param stamp
    * @return
    */
-  visualization_msgs::MarkerArray create_marker_array(const ros::Time& stamp) const {
-    visualization_msgs::MarkerArray markers;
+  visualization_msgs::msg::MarkerArray create_marker_array(const rclcpp::Time& stamp) const {
+    visualization_msgs::msg::MarkerArray markers;
     markers.markers.resize(4);
 
     // node markers
-    visualization_msgs::Marker& traj_marker = markers.markers[0];
+    visualization_msgs::msg::Marker& traj_marker = markers.markers[0];
     traj_marker.header.frame_id = "map";
     traj_marker.header.stamp = stamp;
     traj_marker.ns = "nodes";
     traj_marker.id = 0;
-    traj_marker.type = visualization_msgs::Marker::SPHERE_LIST;
+    traj_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
 
     traj_marker.pose.orientation.w = 1.0;
     traj_marker.scale.x = traj_marker.scale.y = traj_marker.scale.z = 0.5;
 
-    visualization_msgs::Marker& imu_marker = markers.markers[1];
+    visualization_msgs::msg::Marker& imu_marker = markers.markers[1];
     imu_marker.header = traj_marker.header;
     imu_marker.ns = "imu";
     imu_marker.id = 1;
-    imu_marker.type = visualization_msgs::Marker::SPHERE_LIST;
+    imu_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
 
     imu_marker.pose.orientation.w = 1.0;
     imu_marker.scale.x = imu_marker.scale.y = imu_marker.scale.z = 0.75;
@@ -650,12 +771,12 @@ private:
 
       if(keyframes[i]->acceleration) {
         Eigen::Vector3d pos = keyframes[i]->node->estimate().translation();
-        geometry_msgs::Point point;
+        geometry_msgs::msg::Point point;
         point.x = pos.x();
         point.y = pos.y();
         point.z = pos.z();
 
-        std_msgs::ColorRGBA color;
+        std_msgs::msg::ColorRGBA color;
         color.r = 0.0;
         color.g = 0.0;
         color.b = 1.0;
@@ -667,12 +788,12 @@ private:
     }
 
     // edge markers
-    visualization_msgs::Marker& edge_marker = markers.markers[2];
+    visualization_msgs::msg::Marker& edge_marker = markers.markers[2];
     edge_marker.header.frame_id = "map";
     edge_marker.header.stamp = stamp;
     edge_marker.ns = "edges";
     edge_marker.id = 2;
-    edge_marker.type = visualization_msgs::Marker::LINE_LIST;
+    edge_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
 
     edge_marker.pose.orientation.w = 1.0;
     edge_marker.scale.x = 0.05;
@@ -780,12 +901,12 @@ private:
     }
 
     // sphere
-    visualization_msgs::Marker& sphere_marker = markers.markers[3];
+    visualization_msgs::msg::Marker& sphere_marker = markers.markers[3];
     sphere_marker.header.frame_id = "map";
     sphere_marker.header.stamp = stamp;
     sphere_marker.ns = "loop_close_radius";
     sphere_marker.id = 3;
-    sphere_marker.type = visualization_msgs::Marker::SPHERE;
+    sphere_marker.type = visualization_msgs::msg::Marker::SPHERE;
 
     if(!keyframes.empty()) {
       Eigen::Vector3d pos = keyframes.back()->node->estimate().translation();
@@ -808,10 +929,10 @@ private:
    * @param res
    * @return
    */
-  bool dump_service(hdl_graph_slam::DumpGraphRequest& req, hdl_graph_slam::DumpGraphResponse& res) {
+  bool dump_service(std::shared_ptr<hdl_graph_slam::srv::DumpGraph::Request> req, std::shared_ptr<hdl_graph_slam::srv::DumpGraph::Response> res) {
     std::lock_guard<std::mutex> lock(main_thread_mutex);
 
-    std::string directory = req.destination;
+    std::string directory = req->destination;
 
     if(directory.empty()) {
       std::array<char, 64> buffer;
@@ -846,7 +967,7 @@ private:
     ofs << "anchor_edge " << (anchor_edge == nullptr ? -1 : anchor_edge->id()) << std::endl;
     ofs << "floor_node " << (floor_plane_node == nullptr ? -1 : floor_plane_node->id()) << std::endl;
 
-    res.success = true;
+    res->success = true;
     return true;
   }
 
@@ -856,75 +977,68 @@ private:
    * @param res
    * @return
    */
-  bool save_map_service(hdl_graph_slam::SaveMapRequest& req, hdl_graph_slam::SaveMapResponse& res) {
+  bool save_map_service(std::shared_ptr<hdl_graph_slam::srv::SaveMap::Request> req, std::shared_ptr<hdl_graph_slam::srv::SaveMap::Response> res) {
     std::vector<KeyFrameSnapshot::Ptr> snapshot;
 
     keyframes_snapshot_mutex.lock();
     snapshot = keyframes_snapshot;
     keyframes_snapshot_mutex.unlock();
 
-    auto cloud = map_cloud_generator->generate(snapshot, req.resolution);
+    auto cloud = map_cloud_generator->generate(snapshot, req->resolution);
     if(!cloud) {
-      res.success = false;
+      res->success = false;
       return true;
     }
 
-    if(zero_utm && req.utm) {
+    if(zero_utm && req->utm) {
       for(auto& pt : cloud->points) {
         pt.getVector3fMap() += (*zero_utm).cast<float>();
       }
     }
 
-    cloud->header.frame_id = map_frame_id;
+    cloud->header.frame_id = params.map_frame_id;
     cloud->header.stamp = snapshot.back()->cloud->header.stamp;
 
     if(zero_utm) {
-      std::ofstream ofs(req.destination + ".utm");
+      std::ofstream ofs(req->destination + ".utm");
       ofs << boost::format("%.6f %.6f %.6f") % zero_utm->x() % zero_utm->y() % zero_utm->z() << std::endl;
     }
 
-    int ret = pcl::io::savePCDFileBinary(req.destination, *cloud);
-    res.success = ret == 0;
+    int ret = pcl::io::savePCDFileBinary(req->destination, *cloud);
+    res->success = ret == 0;
 
     return true;
   }
 
 private:
   // ROS
-  ros::NodeHandle nh;
-  ros::NodeHandle mt_nh;
-  ros::NodeHandle private_nh;
-  ros::WallTimer optimization_timer;
-  ros::WallTimer map_publish_timer;
+  rclcpp::TimerBase::SharedPtr optimization_timer;
+  rclcpp::TimerBase::SharedPtr map_publish_timer;
 
-  std::unique_ptr<message_filters::Subscriber<nav_msgs::Odometry>> odom_sub;
-  std::unique_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> cloud_sub;
+  std::unique_ptr<message_filters::Subscriber<nav_msgs::msg::Odometry>> odom_sub;
+  std::unique_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> cloud_sub;
   std::unique_ptr<message_filters::Synchronizer<ApproxSyncPolicy>> sync;
 
-  ros::Subscriber gps_sub;
-  ros::Subscriber nmea_sub;
-  ros::Subscriber navsat_sub;
-
-  ros::Subscriber imu_sub;
-  ros::Subscriber floor_sub;
-
-  ros::Publisher markers_pub;
-
-  std::string map_frame_id;
-  std::string odom_frame_id;
+  rclcpp::Subscription<geographic_msgs::msg::GeoPointStamped>::SharedPtr gps_sub;
+  rclcpp::Subscription<nmea_msgs::msg::Sentence>::SharedPtr nmea_sub;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr navsat_sub;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
+  rclcpp::Subscription<msg::FloorCoeffs>::SharedPtr floor_sub;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub;
 
   std::mutex trans_odom2map_mutex;
   Eigen::Matrix4f trans_odom2map;
-  ros::Publisher odom2map_pub;
+  rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr odom2map_pub;
 
   std::string points_topic;
-  ros::Publisher read_until_pub;
-  ros::Publisher map_points_pub;
+  rclcpp::Publisher<std_msgs::msg::Header>::SharedPtr read_until_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_points_pub;
 
-  tf::TransformListener tf_listener;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer;
 
-  ros::ServiceServer dump_service_server;
-  ros::ServiceServer save_map_service_server;
+  rclcpp::Service<srv::DumpGraph>::SharedPtr dump_service_server;
+  rclcpp::Service<srv::SaveMap>::SharedPtr save_map_service_server;
 
   // keyframe queue
   std::string base_frame_id;
@@ -932,30 +1046,20 @@ private:
   std::deque<KeyFrame::Ptr> keyframe_queue;
 
   // gps queue
-  double gps_time_offset;
-  double gps_edge_stddev_xy;
-  double gps_edge_stddev_z;
   boost::optional<Eigen::Vector3d> zero_utm;
   std::mutex gps_queue_mutex;
-  std::deque<geographic_msgs::GeoPointStampedConstPtr> gps_queue;
+  std::deque<geographic_msgs::msg::GeoPointStamped::ConstSharedPtr> gps_queue;
 
   // imu queue
-  double imu_time_offset;
-  bool enable_imu_orientation;
-  double imu_orientation_edge_stddev;
-  bool enable_imu_acceleration;
-  double imu_acceleration_edge_stddev;
   std::mutex imu_queue_mutex;
-  std::deque<sensor_msgs::ImuConstPtr> imu_queue;
+  std::deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_queue;
 
   // floor_coeffs queue
-  double floor_edge_stddev;
   std::mutex floor_coeffs_queue_mutex;
-  std::deque<hdl_graph_slam::FloorCoeffsConstPtr> floor_coeffs_queue;
+  std::deque<hdl_graph_slam::msg::FloorCoeffs::ConstSharedPtr> floor_coeffs_queue;
 
   // for map cloud generation
   std::atomic_bool graph_updated;
-  double map_cloud_resolution;
   std::mutex keyframes_snapshot_mutex;
   std::vector<KeyFrameSnapshot::Ptr> keyframes_snapshot;
   std::unique_ptr<MapCloudGenerator> map_cloud_generator;
@@ -964,14 +1068,13 @@ private:
   // all the below members must be accessed after locking main_thread_mutex
   std::mutex main_thread_mutex;
 
-  int max_keyframes_per_update;
   std::deque<KeyFrame::Ptr> new_keyframes;
 
   g2o::VertexSE3* anchor_node;
   g2o::EdgeSE3* anchor_edge;
   g2o::VertexPlane* floor_plane_node;
   std::vector<KeyFrame::Ptr> keyframes;
-  std::unordered_map<ros::Time, KeyFrame::Ptr, RosTimeHash> keyframe_hash;
+  std::unordered_map<rclcpp::Time, KeyFrame::Ptr, RosTimeHash> keyframe_hash;
 
   std::unique_ptr<GraphSLAM> graph_slam;
   std::unique_ptr<LoopDetector> loop_detector;
@@ -983,4 +1086,5 @@ private:
 
 }  // namespace hdl_graph_slam
 
-PLUGINLIB_EXPORT_CLASS(hdl_graph_slam::HdlGraphSlamNodelet, nodelet::Nodelet)
+#include "rclcpp_components/register_node_macro.hpp"
+RCLCPP_COMPONENTS_REGISTER_NODE(hdl_graph_slam::HdlGraphSlamNode)

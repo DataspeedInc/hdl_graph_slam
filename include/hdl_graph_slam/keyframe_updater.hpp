@@ -3,10 +3,15 @@
 #ifndef KEYFRAME_UPDATER_HPP
 #define KEYFRAME_UPDATER_HPP
 
-#include <ros/ros.h>
 #include <Eigen/Dense>
+#include <iostream>
 
 namespace hdl_graph_slam {
+
+typedef struct {
+  double keyframe_delta_trans;
+  double keyframe_delta_angle;
+} KeyframeUpdaterParams;
 
 /**
  * @brief this class decides if a new frame should be registered to the pose graph as a keyframe
@@ -19,10 +24,7 @@ public:
    * @brief constructor
    * @param pnh
    */
-  KeyframeUpdater(ros::NodeHandle& pnh) : is_first(true), prev_keypose(Eigen::Isometry3d::Identity()) {
-    keyframe_delta_trans = pnh.param<double>("keyframe_delta_trans", 2.0);
-    keyframe_delta_angle = pnh.param<double>("keyframe_delta_angle", 2.0);
-
+  KeyframeUpdater(const KeyframeUpdaterParams& params) : params(params), is_first(true), prev_keypose(Eigen::Isometry3d::Identity()) {
     accum_distance = 0.0;
   }
 
@@ -45,7 +47,7 @@ public:
     double da = Eigen::AngleAxisd(delta.linear()).angle();
 
     // too close to the previous frame
-    if(dx < keyframe_delta_trans && da < keyframe_delta_angle) {
+    if(dx < params.keyframe_delta_trans && da < params.keyframe_delta_angle) {
       return false;
     }
 
@@ -64,8 +66,7 @@ public:
 
 private:
   // parameters
-  double keyframe_delta_trans;  //
-  double keyframe_delta_angle;  //
+  KeyframeUpdaterParams params;
 
   bool is_first;
   double accum_distance;

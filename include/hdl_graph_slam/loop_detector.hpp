@@ -12,6 +12,14 @@
 
 namespace hdl_graph_slam {
 
+typedef struct {
+  double distance_thresh;
+  double accum_distance_thresh;
+  double min_edge_interval;
+  double fitness_score_max_range;
+  double fitness_score_thresh;
+} LoopDetectorParams;
+
 struct Loop {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -36,15 +44,8 @@ public:
    * @brief constructor
    * @param pnh
    */
-  LoopDetector(ros::NodeHandle& pnh) {
-    distance_thresh = pnh.param<double>("distance_thresh", 5.0);
-    accum_distance_thresh = pnh.param<double>("accum_distance_thresh", 8.0);
-    distance_from_last_edge_thresh = pnh.param<double>("min_edge_interval", 5.0);
-
-    fitness_score_max_range = pnh.param<double>("fitness_score_max_range", std::numeric_limits<double>::max());
-    fitness_score_thresh = pnh.param<double>("fitness_score_thresh", 0.5);
-
-    registration = select_registration_method(pnh);
+  LoopDetector(const LoopDetectorParams& loop_detector_params, const RegistrationParams& reg_params) : params(loop_detector_params) {
+    registration = select_registration_method(reg_params);
     last_edge_accum_distance = 0.0;
   }
 
@@ -68,7 +69,7 @@ public:
   }
 
   double get_distance_thresh() const {
-    return distance_thresh;
+    return params.distance_thresh;
   }
 
 private:
@@ -80,7 +81,7 @@ private:
    */
   std::vector<KeyFrame::Ptr> find_candidates(const std::vector<KeyFrame::Ptr>& keyframes, const KeyFrame::Ptr& new_keyframe) const {
     // too close to the last registered loop edge
-    if(new_keyframe->accum_distance - last_edge_accum_distance < distance_from_last_edge_thresh) {
+    if(new_keyframe->accum_distance - last_edge_accum_distance < params.min_edge_interval) {
       return std::vector<KeyFrame::Ptr>();
     }
 
@@ -89,7 +90,7 @@ private:
 
     for(const auto& k : keyframes) {
       // traveled distance between keyframes is too small
-      if(new_keyframe->accum_distance - k->accum_distance < accum_distance_thresh) {
+      if(new_keyframe->accum_distance - k->accum_distance < params.accum_distance_thresh) {
         continue;
       }
 
@@ -98,7 +99,7 @@ private:
 
       // estimated distance between keyframes is too small
       double dist = (pos1.head<2>() - pos2.head<2>()).norm();
-      if(dist > distance_thresh) {
+      if(dist > params.distance_thresh) {
         continue;
       }
 
@@ -129,7 +130,6 @@ private:
     std::cout << "--- loop detection ---" << std::endl;
     std::cout << "num_candidates: " << candidate_keyframes.size() << std::endl;
     std::cout << "matching" << std::flush;
-    auto t1 = ros::Time::now();
 
     pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
     for(const auto& candidate : candidate_keyframes) {
@@ -143,7 +143,7 @@ private:
       registration->align(*aligned, guess);
       std::cout << "." << std::flush;
 
-      double score = registration->getFitnessScore(fitness_score_max_range);
+      double score = registration->getFitnessScore(params.fitness_score_max_range);
       if(!registration->hasConverged() || score > best_score) {
         continue;
       }
@@ -153,11 +153,10 @@ private:
       relative_pose = registration->getFinalTransformation();
     }
 
-    auto t2 = ros::Time::now();
     std::cout << " done" << std::endl;
-    std::cout << "best_score: " << boost::format("%.3f") % best_score << "    time: " << boost::format("%.3f") % (t2 - t1).toSec() << "[sec]" << std::endl;
+    std::cout << "best_score: " << boost::format("%.3f") % best_score << std::endl;
 
-    if(best_score > fitness_score_thresh) {
+    if(best_score > params.fitness_score_thresh) {
       std::cout << "loop not found..." << std::endl;
       return nullptr;
     }
@@ -171,16 +170,9 @@ private:
   }
 
 private:
-  double distance_thresh;                 // estimated distance between keyframes consisting a loop must be less than this distance
-  double accum_distance_thresh;           // traveled distance between ...
-  double distance_from_last_edge_thresh;  // a new loop edge must far from the last one at least this distance
-
-  double fitness_score_max_range;  // maximum allowable distance between corresponding points
-  double fitness_score_thresh;     // threshold for scan matching
-
   double last_edge_accum_distance;
-
   pcl::Registration<PointT, PointT>::Ptr registration;
+  LoopDetectorParams params;
 };
 
 }  // namespace hdl_graph_slam
